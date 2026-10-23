@@ -8,7 +8,14 @@ python3 /tmp/rysk.py inventory
 python3 /tmp/rysk.py screen --collateral 5000 --tenor monthly
 python3 /tmp/rysk.py quote --asset ETH --collateral 5000 --tenor monthly
 python3 /tmp/rysk.py quote --asset ETH --collateral 5000 --delta 0.20
+python3 /tmp/rysk.py quote --asset ETH --collateral 5000 --pay-with USDC --chain 999
+python3 /tmp/rysk.py positions --address <smart account>
 ```
+
+The same put can often be backed by more than one stablecoin, on more than one
+chain. `inventory` lists them per asset (`put_collateral`), and every quote carries
+`collateral_options` plus the one it was priced on (`collateral`). Without
+`--pay-with`/`--chain` a quote uses Rysk's first.
 
 Exit codes: `0` the read succeeded, `1` it did not.
 
@@ -25,7 +32,7 @@ else in the file is unusual.
 """Read Rysk V12 and price an option before anyone sells one.
 
 Rysk is an RFQ venue: you ask, real market makers answer, and the answer is a
-signed quote good for sixty seconds. There is no order book to screen, so what
+signed quote that expires in seconds. There is no order book to screen, so what
 this helper does instead is turn an intent - "earn on $5,000 of USDC, ETH, a
 month out" - into a quote with every number already fixed, and refuse the ones
 an owner should not be shown.
@@ -36,9 +43,9 @@ than the yield:
   * It settles **physically**. An assigned put hands the owner the asset, so
     "you now own 2.04 ETH at $2,150" is simply true. On a cash-settled venue it
     is not, and that gap has to be papered over with a separate spot buy.
-  * Quotes die in **sixty seconds**. Anything that needs a human to read and
-    tap will miss that window, so the signing path needs a session key rather
-    than an approval card.
+  * Quotes die in **seconds**, at a `validUntil` each maker sets. Anything
+    that needs a human to read and tap will miss that window, so an approval
+    card cannot carry a quote.
 
 Everything here is a public read: inventory and quotes need no key, no account
 and no signature. Selling does, and that path is not in this file.
@@ -53,17 +60,34 @@ import ssl
 import struct
 import sys
 import time
+import urllib.request
 
 HOST = "v12.rysk.finance"
 TAKER_PATH = "/taker"
 GAS_URL = "https://v12.rysk.finance/api/gas"
+#: The price each expiry of an asset settled at, 8dp ("0" until it has one).
+#: Like the socket's `positions`, it is what Rysk's own app reads and is not in
+#: the integration doc, so its shape is known from use rather than promised.
+EXPIRY_PRICES_URL = "https://v12.rysk.finance/api/expiry-prices/%d/%s"
 
 #: Rysk's own units. Strikes are 8dp, everything else is 18dp.
 E8 = 10 ** 8
 E18 = 10 ** 18
 
-#: hyperliquid mainnet; 998 is their testnet.
-CHAIN_ID = 999
+#: The same option can be backed on more than one chain, and the collateral
+#: picks which.
+CHAIN_NAMES = {1: "Ethereum", 999: "HyperEVM"}
+
+#: Put collateral, by chain and address. Rysk's `assets` names every market
+#: token but none of these, so they are named here. A label only: the address
+#: that is quoted and locked always comes from Rysk's inventory, never from this
+#: table, and a stablecoin missing here shows as its address rather than a guess.
+STABLES = {
+    (999, "0xb8ce59fc3717ada4c02eadf9682a9e934f625ebb"): "USD₮0",
+    (999, "0xb88339cb7199b77e23db6e890353e22632ba630f"): "USDC",
+    (1, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"): "USDC",
+    (1, "0xdac17f958d2ee523a2206206994597c13d831ec7"): "USDT",
+}
 
 TENOR_DAYS = {"weekly": 7, "monthly": 30, "quarterly": 90}
 
@@ -80,9 +104,8 @@ MAX_ASSIGNMENT_DELTA = 0.35
 MIN_APR_PCT = 4.0
 
 #: Rysk takes fixed size steps that differ per asset and are not published in
-#: the inventory - ETH moves in 0.5, BTC in 0.05, SOL in 10, HYPE in 50. Rather
-#: than hard-code a table that will drift, the helper walks this ladder and
-#: lets the venue say which step it accepts.
+#: the inventory. Rather than hard-code a table that will drift, the helper
+#: walks this ladder and lets the venue say which step it accepts.
 SIZE_STEPS = (0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 50, 100, 500, 1000)
 
 #: A quote is signed and dies at `validUntil`. Anything closer than this to
@@ -193,6 +216,78 @@ def inventory():
     return _call({"id": "inventory", "jsonrpc": "2.0", "method": "inventory"}, "inventory")
 
 
+_tokens = {}
+
+
+def _assets():
+    """Market token address -> (chain id, symbol, decimals), from Rysk's own asset list.
+
+    Inventory names neither a chain nor a symbol; this is where both come from.
+    """
+    if not _tokens:
+        rows = _call({"id": "assets", "jsonrpc": "2.0", "method": "assets"}, "assets") or {}
+        for chain, items in rows.items():
+            for a in items:
+                _tokens[a["address"].lower()] = (int(chain), a["symbol"], int(a.get("decimals") or 18))
+    return _tokens
+
+
+def _symbol(chain_id, address):
+    """Rysk's name for a market token, ours for a stablecoin, else the address."""
+    listed = _assets().get(address.lower())
+    if listed and listed[0] == chain_id:
+        return listed[1]
+    return STABLES.get((chain_id, address.lower()), address)
+
+
+def _norm(symbol):
+    # Tether spells it USD₮0 on-chain; an owner types USDT0.
+    return symbol.upper().replace("₮", "T")
+
+
+def _options(combos):
+    """Every collateral Rysk takes for these options, as it orders them."""
+    tokens, seen, out = _assets(), set(), []
+    for combo in combos:
+        for p in combo.get("products") or []:
+            chain_id = (tokens.get(p["asset"].lower()) or (None,))[0]
+            key = (chain_id, p["collateralAsset"].lower())
+            if chain_id is None or key in seen:
+                continue
+            seen.add(key)
+            out.append({"token": _symbol(chain_id, p["collateralAsset"]),
+                        "chain": CHAIN_NAMES.get(chain_id, str(chain_id)),
+                        "chain_id": chain_id, "address": p["collateralAsset"], "product": p})
+    return out
+
+
+def _label(option):
+    return "%s on %s" % (option["token"], option["chain"])
+
+
+def _public(option):
+    return {k: v for k, v in option.items() if k != "product"}
+
+
+def _choose(options, asset, pay_with, chain_id):
+    """The collateral asked for, or Rysk's first when the caller named none."""
+    if pay_with is None and chain_id is None:
+        return options[0]
+    match = [o for o in options
+             if (pay_with is None or _norm(o["token"]) == _norm(pay_with))
+             and (chain_id is None or o["chain_id"] == chain_id)]
+    takes = ", ".join(_label(o) for o in options)
+    if not match:
+        asked = "%s on %s" % (pay_with or "collateral", CHAIN_NAMES.get(chain_id, chain_id)) \
+            if chain_id is not None else pay_with
+        raise RyskError("Rysk does not take %s for this %s put. It takes: %s"
+                        % (asked, asset, takes))
+    if len(match) > 1:
+        raise RyskError("Rysk takes %s for this %s put on more than one chain - name one "
+                        "with --chain. It takes: %s" % (pay_with, asset, takes))
+    return match[0]
+
+
 def _puts(inv, asset):
     out = []
     for combo in (inv.get(asset, {}).get("combinations") or {}).values():
@@ -216,11 +311,14 @@ def _pick(combos, tenor, otm_pct, target_delta):
         (c["strike"] / (c.get("index") or 1) - 1) * 100 + otm_pct))
 
 
-def quote(asset, collateral_usd, tenor="monthly", otm_pct=10.0, target_delta=None):
+def quote(asset, collateral_usd, tenor="monthly", otm_pct=10.0, target_delta=None,
+          pay_with=None, chain_id=None):
     """Ask real makers what they will pay for one cash-secured put.
 
     The returned price is signed and expires; `valid_for_seconds` is how long
-    is actually left, not how long it was issued for.
+    is actually left, not how long it was issued for. `pay_with` and
+    `chain_id` choose the collateral; `collateral_options` lists every one
+    Rysk takes for that strike.
     """
     asset = asset.upper()
     inv = inventory()
@@ -234,10 +332,11 @@ def quote(asset, collateral_usd, tenor="monthly", otm_pct=10.0, target_delta=Non
     combo = _pick(combos, tenor, otm_pct, target_delta)
     if combo is None:
         raise RyskError("no %s put with an expiry more than a day out" % asset)
-    products = combo.get("products") or []
-    if not products:
+    options = _options([combo])
+    if not options:
         raise RyskError("no tradeable product for that %s strike" % asset)
-    product = products[0]
+    chosen = _choose(options, asset, pay_with, chain_id)
+    product = chosen["product"]
 
     strike = float(combo["strike"])
     index = float(combo.get("index") or 0)
@@ -249,7 +348,7 @@ def quote(asset, collateral_usd, tenor="monthly", otm_pct=10.0, target_delta=Non
         return _call({
             "id": "request", "jsonrpc": "2.0", "method": "request",
             "params": {
-                "asset": product["asset"], "assetName": asset, "chainId": CHAIN_ID,
+                "asset": product["asset"], "assetName": asset, "chainId": chosen["chain_id"],
                 "expiry": combo["expiration_timestamp"], "isPut": True,
                 "quantity": str(int(round(size * E18))),
                 "strike": str(int(round(strike * E8))),
@@ -274,9 +373,8 @@ def quote(asset, collateral_usd, tenor="monthly", otm_pct=10.0, target_delta=Non
             continue
     if result is None:
         raise RyskError(
-            "Rysk would not price $%s of %s: %s. Its sizes step per asset - ETH in 0.5, "
-            "BTC in 0.05, SOL in 10, HYPE in 50 - so a small amount may be under the "
-            "minimum." % (format(collateral_usd, ",.0f"), asset,
+            "Rysk would not price $%s of %s: %s. Its sizes step per asset, so a small "
+            "amount may be under the minimum." % (format(collateral_usd, ",.0f"), asset,
                           str(last) if last else "no maker answered"))
 
     # `price` is PER UNIT, not the total - the same figure comes back for 0.5,
@@ -294,8 +392,11 @@ def quote(asset, collateral_usd, tenor="monthly", otm_pct=10.0, target_delta=Non
         "venue": "rysk",
         "product": "cash_secured_put",
         "settlement": "physical",
+        # The name `acp options open --venue rysk` takes, in Rysk's own words.
+        "instrument": "%s-%s-%s-P" % (asset, combo["expiry"], ("%f" % strike).rstrip("0").rstrip(".")),
         "asset": asset,
-        "chain_id": CHAIN_ID,
+        "chain": chosen["chain"],
+        "chain_id": chosen["chain_id"],
         "strike": strike,
         "index_price": round(index, 4),
         "pct_otm": round((strike / index - 1) * 100, 2) if index else None,
@@ -306,7 +407,8 @@ def quote(asset, collateral_usd, tenor="monthly", otm_pct=10.0, target_delta=Non
         "delta": combo.get("delta"),
         "premium_usd": round(premium, 2),
         "premium_per_unit": round(unit_price, 4),
-        "collateral": {"asset": "USD", "amount": round(collateral, 2)},
+        "collateral": {**_public(chosen), "amount": round(collateral, 2)},
+        "collateral_options": [_public(o) for o in options],
         "apr_pct": round(apr, 2),
         "breakeven": round(strike - unit_price, 2),
         "maker": result.get("maker"),
@@ -348,18 +450,92 @@ def quote(asset, collateral_usd, tenor="monthly", otm_pct=10.0, target_delta=Non
     return q
 
 
-def screen(collateral_usd, tenor="monthly", otm_pct=10.0):
+def screen(collateral_usd, tenor="monthly", otm_pct=10.0, pay_with=None, chain_id=None):
     """What Rysk will actually pay across everything it lists, right now."""
     inv = inventory()
     rows = []
     for asset in sorted(inv):
         try:
-            rows.append(quote(asset, collateral_usd, tenor, otm_pct))
+            rows.append(quote(asset, collateral_usd, tenor, otm_pct,
+                              pay_with=pay_with, chain_id=chain_id))
         except RyskError as exc:
             rows.append({"asset": asset, "venue": "rysk", "tradeable": False,
                          "reasons": [str(exc)]})
     rows.sort(key=lambda r: (not r.get("tradeable"), -(r.get("apr_pct") or 0)))
     return rows
+
+
+def _amount(raw, chain_id, address):
+    """A settlement amount in the token's own units, and the token's name."""
+    listed = _assets().get(address.lower())
+    decimals = listed[2] if listed and listed[0] == chain_id else 6  # stablecoins are 6dp
+    return {"amount": int(raw) / 10 ** decimals, "token": _symbol(chain_id, address),
+            "address": address}
+
+
+def _settled_at(cache, chain_id, asset, expiry):
+    key = (chain_id, asset.lower())
+    if key not in cache:
+        req = urllib.request.Request(EXPIRY_PRICES_URL % key, headers={"User-Agent": "butler-rysk"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as f:
+                cache[key] = json.loads(f.read())
+        except Exception:  # noqa: BLE001 - a missing price is not a failed read of the positions
+            cache[key] = {}
+    raw = cache[key].get(str(expiry))
+    raw = raw.get("price") if isinstance(raw, dict) else raw
+    return int(raw) / E8 if raw and int(raw) else None
+
+
+def positions(address):
+    """Every option `address` has sold on Rysk, open first, then the latest settled.
+
+    `received` is what settlement paid back: the collateral when an option
+    expired worthless, or what assignment delivered instead - cash for a call,
+    the asset for a put. `assigned` is anything back that is not the collateral,
+    so it does not depend on how Rysk labels the payout. `settlement_price` is
+    the price an expired one settled at, None until Rysk has it.
+    """
+    if not (address.startswith("0x") and len(address) == 42):
+        raise RyskError("not an address: %s" % address)
+    rows = _call({"id": "positions", "jsonrpc": "2.0", "method": "positions",
+                  "params": {"address": address}}, "positions")
+    if not isinstance(rows, list):
+        raise RyskError("Rysk's positions were not a list")
+    now, out, prices = time.time(), [], {}
+    for r in rows:
+        chain_id = int(r["chainId"])
+        received = []
+        if int(r.get("payout") or 0):
+            received.append(_amount(r["payout"], chain_id, r["payoutAsset"]))
+        if int(r.get("settlementCollateralPayout") or 0):
+            received.append(_amount(r["settlementCollateralPayout"], chain_id, r["collateral"]))
+        expiry = int(r["expiry"])
+        if r.get("status") == "SETTLED":
+            status = "settled"
+        else:
+            status = "open" if expiry > now else "settling"
+        out.append({
+            "asset": _symbol(chain_id, r["address"]),
+            "asset_address": r["address"],
+            "chain": CHAIN_NAMES.get(chain_id, str(chain_id)),
+            "chain_id": chain_id,
+            "type": "put" if r["isPut"] else "call",
+            "strike": int(r["strike"]) / E18,
+            "size": int(r["quantity"]) / E18,
+            "expiry": time.strftime("%d%b%y", time.gmtime(expiry)).upper().lstrip("0"),
+            "expiry_ts": expiry,
+            "premium_usd": round(int(r.get("premium") or 0) / E18, 2),
+            "status": status,
+            "settlement_price": None if status == "open" else _settled_at(prices, chain_id, r["address"], expiry),
+            "received": received,
+            "assigned": None if status != "settled" else any(
+                x["address"].lower() != r["collateral"].lower() for x in received),
+            "tx": r.get("txHash"),
+        })
+    out.sort(key=lambda p: (p["status"] != "open",
+                            p["expiry_ts"] if p["status"] == "open" else -p["expiry_ts"]))
+    return out
 
 
 def main():
@@ -377,6 +553,12 @@ def main():
     q.add_argument("--tenor", default="monthly", choices=sorted(TENOR_DAYS))
     q.add_argument("--otm-pct", type=float, default=10.0)
     q.add_argument("--delta", type=float, default=None)
+    for cmd in (s, q):
+        cmd.add_argument("--pay-with", default=None, help="collateral token, e.g. USDC or USDT0")
+        cmd.add_argument("--chain", type=int, default=None, choices=sorted(CHAIN_NAMES),
+                         help="the chain the collateral is on")
+    pos = sub.add_parser("positions", help="every option an address has sold, and how it settled")
+    pos.add_argument("--address", required=True, help="the taker: the owner's smart account on HyperEVM")
     a = p.parse_args()
 
     if a.cmd == "inventory":
@@ -384,17 +566,26 @@ def main():
         out = {}
         for asset, body in inv.items():
             combos = list((body.get("combinations") or {}).values())
+            # By settlement time, not by label: "13NOV26" sorts before "30OCT26" as text.
+            settles = {c["expiry"]: c.get("expiration_timestamp") or 0
+                       for c in combos if c.get("expiry")}
             out[asset] = {
                 "strikes": len(combos),
                 "puts": sum(1 for c in combos if c.get("isPut")),
                 "calls": sum(1 for c in combos if not c.get("isPut")),
-                "expiries": sorted({c.get("expiry") for c in combos if c.get("expiry")}),
+                "expiries": sorted(settles, key=settles.get),
+                "put_collateral": [_label(o) for o in _options(c for c in combos if c.get("isPut"))],
+                "call_collateral": [_label(o) for o in _options(c for c in combos if not c.get("isPut"))],
             }
-        print(json.dumps(out, indent=2))
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+    elif a.cmd == "positions":
+        print(json.dumps(positions(a.address), indent=2, ensure_ascii=False))
     elif a.cmd == "screen":
-        print(json.dumps(screen(a.collateral, a.tenor, a.otm_pct), indent=2))
+        rows = screen(a.collateral, a.tenor, a.otm_pct, a.pay_with, a.chain)
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
     else:
-        print(json.dumps(quote(a.asset, a.collateral, a.tenor, a.otm_pct, a.delta), indent=2))
+        print(json.dumps(quote(a.asset, a.collateral, a.tenor, a.otm_pct, a.delta,
+                               a.pay_with, a.chain), indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -1,12 +1,12 @@
 # Rysk V12: the facts that shape a note
 
-Measured live on 22 October 2026. Re-measure before relying on any number: this venue
-is young and what it quotes changes day to day.
+How the venue behaves, not what it quotes. What it lists and prices changes day to
+day, so read that live with the helper and never from this page.
 
 ## What it is
 
 An **RFQ venue**, not an order book. You ask, real market makers answer, and the
-answer is a **signed quote good for sixty seconds**. There is no spread to screen for,
+answer is a **signed quote that expires in seconds**. There is no spread to screen for,
 so the helper screens for the promise instead: how likely assignment is, and whether
 the premium pays for locking the money up.
 
@@ -30,20 +30,11 @@ simply true.
 It is also what makes the wheel possible - an owner who is assigned actually has the
 asset to sell a covered call against.
 
-## What it was quoting, 22 Oct
+## Listed is not quoted
 
-| Asset | APR | Strike | Size step | Smallest ticket |
-| --- | --- | --- | --- | --- |
-| HYPE | 25.6% | $70 | 50 | ~$3,500 |
-| SOL | 22.5% | $95 | 10 | ~$950 |
-| ETH | 22.4% | $2,150 | 0.5 | ~$1,075 |
-| BTC | 15.8% | $75,000 | 0.05 | ~$3,750 |
-
-Listed but **not quoting puts**: PUMP, PURR, XRP, ZEC. XAUT lists strikes but refused
-every size tried.
-
-So "nine assets" is the inventory, not the menu. The menu is whatever answers today,
-which is why the skill screens live rather than carrying a list.
+An asset can be in the inventory with no puts at all, with no strikes, or with strikes
+no maker will price. The inventory is not the menu: the menu is whatever answers
+today, which is why the skill screens live rather than carrying a list.
 
 ## Sizes step, and the steps are not published
 
@@ -54,8 +45,8 @@ trade size too small      under the minimum
 trade increment is wrong  not a multiple of the step
 ```
 
-ETH moves in 0.5, BTC in 0.05, SOL in 10, HYPE in 50. The helper walks a ladder of
-candidate steps rather than hard-coding that table, because it will drift.
+The helper walks a ladder of candidate steps rather than hard-coding a table per
+asset, because it would drift.
 
 The practical consequence is that **a round dollar amount rarely lands exactly** -
 $5,000 of ETH becomes 2.0 ETH against a $2,150 strike, so $4,300 works and $700 does
@@ -69,20 +60,25 @@ figure comes back for 0.5, 1 and 1.5 of the same option.
 Multiply by the quantity to get what the owner actually receives. Reading it as the
 total understates a large position and overstates a small one.
 
-## Sixty seconds
+## Quotes expire in seconds
 
-A quote is signed and carries `validUntil`. Measured: exactly **60 seconds** from
-issue.
+A quote is signed and carries `validUntil`, which each maker sets for itself. Never
+assume a figure: read `valid_for_seconds` on the quote in hand.
 
 The flow is quote -> gas fee -> sign -> confirm, all inside that. **An approval card
-will not survive it** - an owner cannot read and tap in under a minute. Selling needs
-a session key that signs without a card, the way the Papertrade skill does.
+will not survive it** - an owner cannot read and tap that fast.
 
-Until that exists, re-quote immediately before signing and check `valid_for_seconds`.
+So a sale goes through `acp options open --venue rysk`: the card approves a floor, and
+after the approval Butler's server asks Rysk again and signs a fresh quote that clears
+it. The quotes the helper shows are for choosing, never for acting on.
 
 ## Chain and contracts
 
-HyperEVM mainnet, **chain id 999** (998 testnet). Collateral is approved to a spender
+HyperEVM mainnet (**chain id 999**) and Ethereum mainnet (**1**). The collateral
+decides the chain, and which stablecoins and chains an asset takes changes, so the
+helper lists them live (`put_collateral`, `collateral_options`) rather than from this
+page. Rysk's `assets` call names each market token's chain; the helper reads it rather
+than assuming one. Collateral is approved to a spender
 that differs per chain, and the EIP-712 verifying contract differs per chain too.
 Both are published in Rysk's integration doc rather than here, because a wrong
 address sends money to a stranger and an address in a skill is one edit from doing
